@@ -205,7 +205,78 @@ uint64_t reserved_bytes(cudaMemPool_t pool) {
       cudaSuccess);
   return reserved;
 }
+
+bool device_supports_memory_pools(int device) {
+  int value = 0;
+  return cudaDeviceGetAttribute(
+             &value, cudaDevAttrMemoryPoolsSupported, device) == cudaSuccess &&
+      value != 0;
+}
 } // namespace
+
+// The pool tests below only mean something on a device with memory pools.
+// Data-center GPUs in TCC mode on Windows have none, and there the allocator
+// takes the synchronous path the two tests after this fixture check.
+class CudaAllocatorPoolTest : public CudaAllocatorTest {
+ protected:
+  void SetUp() override {
+    CudaAllocatorTest::SetUp();
+    if (!IsSkipped() && !device_supports_memory_pools(0)) {
+      GTEST_SKIP() << "device 0 does not support memory pools";
+    }
+  }
+};
+
+// Works on every device: with memory pools through the pool, without them
+// through cudaMalloc. This is what failed on a device without pools, where
+// cudaMallocAsync returned cudaErrorNotSupported and nothing fell back.
+TEST_F(CudaAllocatorTest, AllocateAsyncRoundtrip) {
+  cudaStream_t stream;
+  ASSERT_EQ(cudaStreamCreate(&stream), cudaSuccess);
+
+  constexpr size_t kBytes = 1u << 20;
+  auto res = CudaAllocator::allocate_async(kBytes, 0, stream);
+  ASSERT_TRUE(res.ok()) << "allocate_async failed on device 0";
+  std::vector<uint8_t> h_src(kBytes, 9), h_dst(kBytes, 0);
+  ASSERT_EQ(
+      cudaMemcpyAsync(
+          res.get(), h_src.data(), kBytes, cudaMemcpyHostToDevice, stream),
+      cudaSuccess);
+  ASSERT_EQ(
+      cudaMemcpyAsync(
+          h_dst.data(), res.get(), kBytes, cudaMemcpyDeviceToHost, stream),
+      cudaSuccess);
+  ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
+  EXPECT_EQ(h_src, h_dst);
+
+  CudaAllocator::deallocate_async(res.get(), 0, stream);
+  ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
+  ASSERT_EQ(cudaStreamDestroy(stream), cudaSuccess);
+}
+
+// Without memory pools the allocator must not create one or leave an error
+// behind, and releasing cached memory must have nothing to do.
+TEST_F(CudaAllocatorTest, FallsBackWithoutMemoryPools) {
+  if (device_supports_memory_pools(0)) {
+    GTEST_SKIP() << "device 0 supports memory pools; covered by the pool tests";
+  }
+  cudaStream_t stream;
+  ASSERT_EQ(cudaStreamCreate(&stream), cudaSuccess);
+  // Earlier tests switch to a missing device on purpose, which leaves
+  // cudaErrorInvalidDevice as this thread's last error; only the calls below
+  // are under test.
+  (void)cudaGetLastError();
+
+  auto res = CudaAllocator::allocate_async(4096, -1, stream);
+  ASSERT_TRUE(res.ok());
+  EXPECT_EQ(CudaAllocator::pool_for_device(0), nullptr)
+      << "no pool can exist on a device without memory pools";
+  CudaAllocator::deallocate_async(res.get(), -1, stream);
+  CudaAllocator::release_cached_memory(-1);
+  EXPECT_EQ(cudaGetLastError(), cudaSuccess);
+
+  ASSERT_EQ(cudaStreamDestroy(stream), cudaSuccess);
+}
 
 // The delegate allocates from a pool it owns, so its retained memory must not
 // land in the device default pool that other users of the async allocator
@@ -213,7 +284,7 @@ uint64_t reserved_bytes(cudaMemPool_t pool) {
 // The retention threshold is the whole point of owning a pool: at the default
 // of zero the driver empties it on every synchronize. Nothing else in this
 // suite notices a smaller value, so it is asserted directly.
-TEST_F(CudaAllocatorTest, PoolRetainsMemoryWithoutLimit) {
+TEST_F(CudaAllocatorPoolTest, PoolRetainsMemoryWithoutLimit) {
   cudaStream_t stream;
   ASSERT_EQ(cudaStreamCreate(&stream), cudaSuccess);
 
@@ -236,7 +307,7 @@ TEST_F(CudaAllocatorTest, PoolRetainsMemoryWithoutLimit) {
   ASSERT_EQ(cudaStreamDestroy(stream), cudaSuccess);
 }
 
-TEST_F(CudaAllocatorTest, AllocatesFromItsOwnPool) {
+TEST_F(CudaAllocatorPoolTest, AllocatesFromItsOwnPool) {
   cudaStream_t stream;
   ASSERT_EQ(cudaStreamCreate(&stream), cudaSuccess);
 
@@ -262,7 +333,7 @@ TEST_F(CudaAllocatorTest, AllocatesFromItsOwnPool) {
 // Freed memory is kept so repeated allocation stays cheap, which means a plain
 // free no longer shrinks the pool. Without an explicit release a long lived
 // process would hold that memory after every program was gone.
-TEST_F(CudaAllocatorTest, ReleaseCachedMemoryReturnsPoolMemory) {
+TEST_F(CudaAllocatorPoolTest, ReleaseCachedMemoryReturnsPoolMemory) {
   cudaStream_t stream;
   ASSERT_EQ(cudaStreamCreate(&stream), cudaSuccess);
 
@@ -287,7 +358,7 @@ TEST_F(CudaAllocatorTest, ReleaseCachedMemoryReturnsPoolMemory) {
 }
 
 // Releasing must not disturb allocations that are still in use.
-TEST_F(CudaAllocatorTest, ReleaseCachedMemoryKeepsLiveAllocations) {
+TEST_F(CudaAllocatorPoolTest, ReleaseCachedMemoryKeepsLiveAllocations) {
   cudaStream_t stream;
   ASSERT_EQ(cudaStreamCreate(&stream), cudaSuccess);
 
@@ -326,7 +397,7 @@ TEST_F(CudaAllocatorTest, ReleaseCachedMemoryKeepsLiveAllocations) {
 // current one. This runner has a single GPU, so the two cannot be told apart
 // here; what it pins is that the sentinel is resolved rather than passed to the
 // driver.
-TEST_F(CudaAllocatorTest, ReleaseCachedMemoryAcceptsTheAllDevicesSentinel) {
+TEST_F(CudaAllocatorPoolTest, ReleaseCachedMemoryAcceptsTheAllDevicesSentinel) {
   cudaStream_t stream;
   ASSERT_EQ(cudaStreamCreate(&stream), cudaSuccess);
 
@@ -351,7 +422,7 @@ TEST_F(CudaAllocatorTest, ReleaseCachedMemoryAcceptsTheAllDevicesSentinel) {
 // Memory allocated during a graph capture goes to the device graph pool, which
 // the pool trim cannot reach, so releasing has to trim that too. Without the
 // graph trim this is the only new test that fails.
-TEST_F(CudaAllocatorTest, ReleaseCachedMemoryReturnsGraphMemory) {
+TEST_F(CudaAllocatorPoolTest, ReleaseCachedMemoryReturnsGraphMemory) {
   cudaStream_t stream;
   ASSERT_EQ(cudaStreamCreate(&stream), cudaSuccess);
 

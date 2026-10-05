@@ -121,6 +121,38 @@ cudaMemPool_t mem_pool_for(int device) {
   return pool;
 }
 
+// Whether `device` supports the stream-ordered allocator. Devices without
+// memory pools, such as data-center GPUs in TCC mode on Windows, reject
+// cudaMallocAsync and cudaMemPoolCreate with cudaErrorNotSupported, so their
+// allocations take the synchronous path instead. Cached because it is asked on
+// every allocation. An attribute query that fails is treated as supported,
+// which keeps the stream-ordered path and its own error reporting.
+bool memory_pools_supported(int device) {
+  static std::mutex mutex;
+  static std::unordered_map<int, bool> cache;
+  const std::lock_guard<std::mutex> lock(mutex);
+  const auto it = cache.find(device);
+  if (it != cache.end()) {
+    return it->second;
+  }
+  int value = 0;
+  const cudaError_t err =
+      cudaDeviceGetAttribute(&value, cudaDevAttrMemoryPoolsSupported, device);
+  if (err != cudaSuccess) {
+    (void)cudaGetLastError();
+  }
+  const bool supported = err != cudaSuccess || value != 0;
+  if (!supported) {
+    ET_LOG(
+        Info,
+        "CUDA device %d does not support memory pools; stream-ordered "
+        "allocations use cudaMalloc and cudaFree instead.",
+        device);
+  }
+  cache.emplace(device, supported);
+  return supported;
+}
+
 #endif // !EXECUTORCH_USE_HIP
 
 Error copy_impl(
@@ -426,6 +458,13 @@ Result<void*> CudaAllocator::allocate_async(
     (void)cudaGetLastError();
     stream_device = -1;
   }
+  const int target = device >= 0 ? device : stream_device;
+  if (target >= 0 && !memory_pools_supported(target)) {
+    // Without memory pools there is no stream-ordered allocation to make. A
+    // synchronous allocation is usable from any stream at once, so the caller's
+    // ordering still holds; deallocate_async frees it to match.
+    return CudaAllocator::instance().allocate(nbytes, index);
+  }
   cudaMemPool_t pool =
       (device >= 0 && device == stream_device) ? mem_pool_for(device) : nullptr;
   if (device >= 0) {
@@ -459,6 +498,23 @@ void CudaAllocator::deallocate_async(
   if (ptr == nullptr) {
     return;
   }
+
+#if !defined(EXECUTORCH_USE_HIP)
+  // Decided by the device the memory lives on, the same answer allocate_async
+  // reached for it. cudaFree waits for all work on the device first, so work
+  // still using the block on `stream` finishes before it is released.
+  cudaPointerAttributes attributes{};
+  if (cudaPointerGetAttributes(&attributes, ptr) == cudaSuccess) {
+    if (attributes.type == cudaMemoryTypeDevice && attributes.device >= 0 &&
+        !memory_pools_supported(attributes.device)) {
+      CudaAllocator::instance().deallocate(
+          ptr, static_cast<DeviceIndex>(attributes.device));
+      return;
+    }
+  } else {
+    (void)cudaGetLastError();
+  }
+#endif
 
   cudaError_t err = cudaFreeAsync(ptr, stream);
   if (err != cudaSuccess) {
@@ -535,7 +591,11 @@ void CudaAllocator::release_cached_memory(DeviceIndex index) {
     // Device scoped, unlike everything else in this function: it releases
     // unused graph memory cached by every user of the device, so another
     // library in this process pays to map its own graph allocations again.
-    // Nothing breaks, since only unused blocks go.
+    // Nothing breaks, since only unused blocks go. Graph memory is served by
+    // memory pools, so a device without them has none to release.
+    if (!memory_pools_supported(device)) {
+      continue;
+    }
     const cudaError_t graph_err = cudaDeviceGraphMemTrim(device);
     if (graph_err != cudaSuccess) {
       ET_LOG(

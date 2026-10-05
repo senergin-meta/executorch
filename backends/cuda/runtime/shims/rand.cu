@@ -11,6 +11,7 @@
 #include <executorch/backends/aoti/slim/cuda/guard.h>
 #include <executorch/backends/aoti/slim/factory/empty.h>
 #include <executorch/backends/aoti/slim/util/size_util.h>
+#include <executorch/backends/cuda/runtime/cuda_allocator.h>
 #include <executorch/runtime/platform/assert.h>
 #include <executorch/runtime/platform/log.h>
 
@@ -60,7 +61,14 @@ static std::once_flag g_rng_init_flag;
 // from any thread are no-ops thanks to std::call_once.
 void ensure_rng_init(cudaStream_t stream) {
   std::call_once(g_rng_init_flag, [&]() {
-    cudaMallocAsync(&d_rng, sizeof(RngState), stream);
+    // Through the backend allocator, which falls back to cudaMalloc on a device
+    // without memory pools, where cudaMallocAsync is not supported.
+    auto rng = CudaAllocator::allocate_async(sizeof(RngState), -1, stream);
+    if (!rng.ok()) {
+      ET_LOG(Error, "rand: allocating the RNG state failed");
+      return;
+    }
+    d_rng = static_cast<RngState*>(rng.get());
     RngState h;
     h.seed = static_cast<unsigned long long>(time(nullptr));
     h.counter = 0;

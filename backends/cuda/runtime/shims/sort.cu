@@ -17,6 +17,7 @@
 #include <new>
 
 #include <executorch/backends/aoti/utils.h>
+#include <executorch/backends/cuda/runtime/cuda_allocator.h>
 #include <executorch/backends/cuda/runtime/shims/memory.h>
 #include <executorch/backends/cuda/runtime/shims/sort.h>
 #include <executorch/backends/aoti/slim/cuda/guard.h>
@@ -111,21 +112,22 @@ void launch_permute(
 }
 
 // Stream-ordered scratch for thrust. With par_nosync this keeps each slice sort
-// from blocking on cudaMalloc/cudaFree and synchronizing the stream.
+// from blocking on cudaMalloc/cudaFree and synchronizing the stream. Through the
+// backend allocator, which falls back to those on a device without memory pools.
 struct StreamOrderedAllocator {
   using value_type = char;
 
   char* allocate(std::ptrdiff_t bytes) {
-    void* ptr = nullptr;
-    if (cudaMallocAsync(&ptr, static_cast<size_t>(bytes), stream) !=
-        cudaSuccess) {
+    auto ptr =
+        CudaAllocator::allocate_async(static_cast<size_t>(bytes), -1, stream);
+    if (!ptr.ok()) {
       throw std::bad_alloc();
     }
-    return static_cast<char*>(ptr);
+    return static_cast<char*>(ptr.get());
   }
 
   void deallocate(char* ptr, size_t) {
-    (void)cudaFreeAsync(ptr, stream);
+    CudaAllocator::deallocate_async(ptr, -1, stream);
   }
 
   cudaStream_t stream;
@@ -318,14 +320,21 @@ AOTITorchError aoti_torch_cuda_sort_stable(
       inner_size *= input_sizes[d];
     }
 
-    ET_CUDA_CHECK_OR_RETURN_ERROR(cudaMallocAsync(
-        &temp_values_buf,
-        static_cast<size_t>(total_elements * elem_size),
-        stream));
-    ET_CUDA_CHECK_OR_RETURN_ERROR(cudaMallocAsync(
-        &temp_indices_buf,
-        static_cast<size_t>(total_elements) * sizeof(int64_t),
-        stream));
+    auto values = CudaAllocator::allocate_async(
+        static_cast<size_t>(total_elements * elem_size), -1, stream);
+    ET_CHECK_OR_RETURN_ERROR(
+        values.ok(),
+        MemoryAllocationFailed,
+        "sort: allocating the transposed values failed");
+    temp_values_buf = values.get();
+    auto indices = CudaAllocator::allocate_async(
+        static_cast<size_t>(total_elements) * sizeof(int64_t), -1, stream);
+    if (!indices.ok()) {
+      CudaAllocator::deallocate_async(temp_values_buf, -1, stream);
+      ET_LOG(Error, "sort: allocating the transposed indices failed");
+      return Error::MemoryAllocationFailed;
+    }
+    temp_indices_buf = indices.get();
 
     // Gather: [outer, sort, inner] → [outer, inner, sort]
     launch_permute(
@@ -450,8 +459,8 @@ AOTITorchError aoti_torch_cuda_sort_stable(
         stream);
     ET_CUDA_KERNEL_LAUNCH_CHECK_OR_RETURN_ERROR();
 
-    ET_CUDA_CHECK_OR_RETURN_ERROR(cudaFreeAsync(temp_values_buf, stream));
-    ET_CUDA_CHECK_OR_RETURN_ERROR(cudaFreeAsync(temp_indices_buf, stream));
+    CudaAllocator::deallocate_async(temp_values_buf, -1, stream);
+    CudaAllocator::deallocate_async(temp_indices_buf, -1, stream);
   }
 
   return Error::Ok;
